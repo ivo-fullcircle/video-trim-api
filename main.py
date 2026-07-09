@@ -57,11 +57,14 @@ def trim(req: TrimRequest, x_api_key: str | None = Header(default=None)):
 
 
 def _download(url: str, dest_path: str):
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+    try:
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"could not download video_url: {e}")
 
 
 def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: float):
