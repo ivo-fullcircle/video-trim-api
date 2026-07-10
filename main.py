@@ -19,6 +19,10 @@ class TrimRequest(BaseModel):
     end: float  # seconds
 
 
+class ExtractAudioRequest(BaseModel):
+    video_url: str
+
+
 def check_api_key(x_api_key: str | None):
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
@@ -56,9 +60,40 @@ def trim(req: TrimRequest, x_api_key: str | None = Header(default=None)):
         pass
 
 
+@app.post("/extract-audio")
+def extract_audio(req: ExtractAudioRequest, x_api_key: str | None = Header(default=None)):
+    check_api_key(x_api_key)
+
+    job_id = uuid.uuid4().hex
+    tmp_dir = tempfile.mkdtemp(prefix=f"audio-{job_id}-")
+    input_path = os.path.join(tmp_dir, "input")
+    output_path = os.path.join(tmp_dir, "output.mp3")
+
+    _download(req.video_url, input_path)
+    _run_ffmpeg_extract_audio(input_path, output_path)
+    return FileResponse(output_path, media_type="audio/mpeg", filename="audio.mp3")
+
+
+def _run_ffmpeg_extract_audio(input_path: str, output_path: str):
+    # Low bitrate mono speech encoding: plenty for Whisper transcription,
+    # keeps even long episodes comfortably under OpenAI's 25MB upload limit.
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "libmp3lame", "-b:a", "32k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
+
+
 def _download(url: str, dest_path: str):
     try:
-        with requests.get(url, stream=True, timeout=60) as r:
+        with requests.get(url, stream=True, timeout=180) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
