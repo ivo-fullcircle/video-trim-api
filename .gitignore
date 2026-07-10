@@ -1,0 +1,3 @@
+.api_key_do_not_commit.txt
+__pycache__/
+*.pyc
