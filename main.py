@@ -110,7 +110,7 @@ def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: 
         "-ss", str(start),
         "-i", input_path,
         "-t", str(duration),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
