@@ -86,7 +86,10 @@ def _run_ffmpeg_extract_audio(input_path: str, output_path: str):
         "-c:a", "libmp3lame", "-b:a", "32k",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="ffmpeg timed out after 280s")
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
 
@@ -104,19 +107,25 @@ def _download(url: str, dest_path: str):
 
 def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: float):
     # Re-encode (not stream copy) so the cut lands exactly on start/duration
-    # regardless of keyframe placement in the source file. Also center-crop
-    # to exactly 1080x1920 (9:16) — Captions.ai rejects anything else, and
-    # source footage (landscape podcast recordings, vertical phone hooks) varies.
+    # regardless of keyframe placement in the source file. Crop to 9:16 at the
+    # source resolution FIRST, then scale to 1080x1920 — scaling first (as the
+    # previous version did) blows up a landscape source to a huge intermediate
+    # frame (e.g. 1920x1080 -> 3413x1920) before cropping, which timed out on
+    # Render's free-tier CPU.
+    crop = "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'"
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", input_path,
         "-t", str(duration),
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-vf", f"{crop},scale=1080:1920",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="ffmpeg timed out after 280s")
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
