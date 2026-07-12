@@ -104,12 +104,15 @@ def _download(url: str, dest_path: str):
 
 def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: float):
     # Re-encode (not stream copy) so the cut lands exactly on start/duration
-    # regardless of keyframe placement in the source file.
+    # regardless of keyframe placement in the source file. Also center-crop
+    # to exactly 1080x1920 (9:16) — Captions.ai rejects anything else, and
+    # source footage (landscape podcast recordings, vertical phone hooks) varies.
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", input_path,
         "-t", str(duration),
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
