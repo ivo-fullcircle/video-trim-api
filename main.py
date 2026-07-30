@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -20,6 +21,10 @@ class TrimRequest(BaseModel):
 
 
 class ExtractAudioRequest(BaseModel):
+    video_url: str
+
+
+class ProbeRequest(BaseModel):
     video_url: str
 
 
@@ -72,6 +77,54 @@ def extract_audio(req: ExtractAudioRequest, x_api_key: str | None = Header(defau
     _download(req.video_url, input_path)
     _run_ffmpeg_extract_audio(input_path, output_path)
     return FileResponse(output_path, media_type="audio/mpeg", filename="audio.mp3")
+
+
+@app.post("/probe")
+def probe(req: ProbeRequest, x_api_key: str | None = Header(default=None)):
+    check_api_key(x_api_key)
+
+    job_id = uuid.uuid4().hex
+    tmp_dir = tempfile.mkdtemp(prefix=f"probe-{job_id}-")
+    input_path = os.path.join(tmp_dir, "input")
+
+    _download(req.video_url, input_path)
+    return _run_ffprobe(input_path)
+
+
+def _run_ffprobe(input_path: str) -> dict:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json",
+        input_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="ffprobe timed out after 60s")
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffprobe failed: {result.stderr[-2000:]}")
+
+    data = json.loads(result.stdout)
+    streams = data.get("streams", [])
+    if not streams:
+        raise HTTPException(status_code=400, detail="no video stream found in file")
+    width = streams[0].get("width")
+    height = streams[0].get("height")
+    duration = float(data.get("format", {}).get("duration", 0))
+
+    if width and height:
+        orientation = "horizontal" if width > height else "vertical" if height > width else "square"
+    else:
+        orientation = "unknown"
+
+    return {
+        "width": width,
+        "height": height,
+        "duration_seconds": round(duration, 1),
+        "orientation": orientation,
+    }
 
 
 def _run_ffmpeg_extract_audio(input_path: str, output_path: str):
