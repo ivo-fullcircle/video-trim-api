@@ -28,6 +28,18 @@ class ProbeRequest(BaseModel):
     video_url: str
 
 
+class Caption(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
+class ComposeRequest(BaseModel):
+    background_video_url: str
+    audio_url: str
+    captions: list[Caption] = []
+
+
 def check_api_key(x_api_key: str | None):
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
@@ -125,6 +137,77 @@ def _run_ffprobe(input_path: str) -> dict:
         "duration_seconds": round(duration, 1),
         "orientation": orientation,
     }
+
+
+@app.post("/compose")
+def compose(req: ComposeRequest, x_api_key: str | None = Header(default=None)):
+    check_api_key(x_api_key)
+
+    job_id = uuid.uuid4().hex
+    tmp_dir = tempfile.mkdtemp(prefix=f"compose-{job_id}-")
+    bg_path = os.path.join(tmp_dir, "bg.mp4")
+    audio_path = os.path.join(tmp_dir, "audio.mp3")
+    srt_path = os.path.join(tmp_dir, "captions.srt")
+    output_path = os.path.join(tmp_dir, "output.mp4")
+
+    _download(req.background_video_url, bg_path)
+    _download(req.audio_url, audio_path)
+    audio_duration = _get_duration(audio_path)
+    _write_srt(req.captions, srt_path)
+    _run_ffmpeg_compose(bg_path, audio_path, srt_path, audio_duration, output_path)
+    return FileResponse(output_path, media_type="video/mp4", filename="composed.mp4")
+
+
+def _get_duration(path: str) -> float:
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffprobe failed: {result.stderr[-1000:]}")
+    return float(json.loads(result.stdout)["format"]["duration"])
+
+
+def _format_srt_time(seconds: float) -> str:
+    total_ms = int(round(seconds * 1000))
+    hours, total_ms = divmod(total_ms, 3600000)
+    minutes, total_ms = divmod(total_ms, 60000)
+    secs, ms = divmod(total_ms, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _write_srt(captions: list[Caption], path: str):
+    with open(path, "w") as f:
+        for i, c in enumerate(captions, start=1):
+            f.write(f"{i}\n")
+            f.write(f"{_format_srt_time(c.start)} --> {_format_srt_time(c.end)}\n")
+            f.write(f"{c.text}\n\n")
+
+
+def _run_ffmpeg_compose(bg_path: str, audio_path: str, srt_path: str, duration: float, output_path: str):
+    # Loop the background to cover the full audio length, crop/scale to 1080x1920
+    # (covers both landscape and already-vertical source loops), burn in captions
+    # from the srt, and replace the background's own audio with the TTS track.
+    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+    subtitle_style = (
+        "FontSize=64,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=250"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1", "-i", bg_path,
+        "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={srt_escaped}:force_style='{subtitle_style}'",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-t", str(duration),
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="ffmpeg timed out after 280s")
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
 def _run_ffmpeg_extract_audio(input_path: str, output_path: str):
