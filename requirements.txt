@@ -1,3 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 requests==2.32.3
+# Unpinned on purpose: yt-dlp ships near-daily releases to keep up with
+# site changes on YouTube/TikTok/Instagram. Pinning an old version here
+# would silently start failing downloads within weeks.
+yt-dlp

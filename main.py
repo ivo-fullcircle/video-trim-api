@@ -5,6 +5,7 @@ import tempfile
 import uuid
 
 import requests
+import yt_dlp
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -26,6 +27,10 @@ class ExtractAudioRequest(BaseModel):
 
 class ProbeRequest(BaseModel):
     video_url: str
+
+
+class FetchAudioRequest(BaseModel):
+    source_url: str  # a page URL (YouTube/TikTok/Instagram/...), not a direct file link
 
 
 class Caption(BaseModel):
@@ -101,6 +106,50 @@ def probe(req: ProbeRequest, x_api_key: str | None = Header(default=None)):
 
     _download(req.video_url, input_path)
     return _run_ffprobe(input_path)
+
+
+@app.post("/fetch-audio")
+def fetch_audio(req: FetchAudioRequest, x_api_key: str | None = Header(default=None)):
+    # For the reference-research engine: source_url is a YouTube/TikTok/Instagram
+    # PAGE link (not a direct file), so the plain _download() used elsewhere can't
+    # read it -- yt-dlp resolves the real media stream first. We only need audio
+    # (for Whisper transcription), so we ask yt-dlp for audio-only to keep this
+    # fast and avoid downloading full video we won't use.
+    check_api_key(x_api_key)
+
+    job_id = uuid.uuid4().hex
+    tmp_dir = tempfile.mkdtemp(prefix=f"fetch-{job_id}-")
+    output_template = os.path.join(tmp_dir, "audio.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "128",
+        }],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(req.source_url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=400, detail=f"could not fetch source_url: {e}")
+
+    output_path = os.path.join(tmp_dir, "audio.mp3")
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=500, detail="yt-dlp did not produce an mp3 file")
+
+    headers = {
+        "X-Source-Title": (info.get("title") or "")[:200].encode("ascii", "ignore").decode(),
+        "X-Source-Duration-Seconds": str(info.get("duration") or ""),
+        "X-Source-Uploader": (info.get("uploader") or "")[:200].encode("ascii", "ignore").decode(),
+    }
+    return FileResponse(output_path, media_type="audio/mpeg", filename="audio.mp3", headers=headers)
 
 
 def _run_ffprobe(input_path: str) -> dict:
