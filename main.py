@@ -33,6 +33,11 @@ class FetchAudioRequest(BaseModel):
     source_url: str  # a page URL (YouTube/TikTok/Instagram/...), not a direct file link
 
 
+class ListVideosRequest(BaseModel):
+    profile_url: str  # a channel/profile page URL (YouTube channel, TikTok @user, ...)
+    limit: int = 5
+
+
 class Caption(BaseModel):
     start: float
     end: float
@@ -150,6 +155,62 @@ def fetch_audio(req: FetchAudioRequest, x_api_key: str | None = Header(default=N
         "X-Source-Uploader": (info.get("uploader") or "")[:200].encode("ascii", "ignore").decode(),
     }
     return FileResponse(output_path, media_type="audio/mpeg", filename="audio.mp3", headers=headers)
+
+
+@app.post("/list-videos")
+def list_videos(req: ListVideosRequest, x_api_key: str | None = Header(default=None)):
+    # For the reference-research engine's auto-discovery: given a creator's
+    # channel/profile page (not a specific video), list their most recent
+    # videos WITHOUT downloading anything -- extract_flat skips resolving
+    # each video's real media URL, so this is fast and cheap. The research
+    # engine then picks one of these page URLs and feeds it to /fetch-audio
+    # like it would any manually-pasted video link.
+    check_api_key(x_api_key)
+
+    profile_url = req.profile_url.rstrip("/")
+    if "youtube.com/@" in profile_url and not any(
+        profile_url.endswith(tab) for tab in ("/videos", "/shorts", "/streams", "/playlists")
+    ):
+        # A bare YouTube channel URL (.../@handle) resolves to the channel's
+        # TABS (Videos/Live/Shorts) as flat entries, not actual videos --
+        # the /videos tab is what actually lists individual uploads.
+        profile_url = profile_url + "/videos"
+
+    ydl_opts = {
+        "extract_flat": "in_playlist",
+        "playlistend": max(1, min(req.limit, 20)),
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(profile_url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=400, detail=f"could not list profile_url: {e}")
+
+    entries = info.get("entries") if info else None
+    if not entries:
+        # Some extractors resolve a single-video URL straight to a video
+        # entry instead of a playlist -- treat that as a 1-video result
+        # rather than an error.
+        if info and info.get("webpage_url"):
+            entries = [info]
+        else:
+            raise HTTPException(status_code=404, detail="no videos found for this profile_url")
+
+    videos = []
+    for e in entries[: req.limit]:
+        url = e.get("url") or e.get("webpage_url")
+        if not url:
+            continue
+        videos.append({
+            "url": url,
+            "title": (e.get("title") or "")[:200],
+            "duration_seconds": e.get("duration"),
+        })
+
+    return {"videos": videos}
 
 
 def _run_ffprobe(input_path: str) -> dict:
