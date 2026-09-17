@@ -5,7 +5,9 @@ Small self-hosted service that trims a segment out of a video, given a public UR
 ## Endpoints
 
 - `GET /health` — returns `{"status": "ok"}`
-- `POST /trim` — body `{"video_url": "...", "start": 12.5, "end": 42.0}`, header `X-API-Key: <secret>` — returns the trimmed MP4 file directly in the response body.
+- `POST /trim` — body `{"video_url": "...", "start": 12.5, "end": 42.0, "title_text": "...", "title_seconds": 1.4}`, header `X-API-Key: <secret>` — returns the trimmed MP4 file directly in the response body. `title_text` is optional: when set, burns an on-brand full-frame title card (the "graphic hook" -- what the video is about, shown before/over the talking head) into the first `title_seconds` (default 1.4s) of the clip.
+- `POST /compose` — same optional `title_text`/`title_seconds` as `/trim`.
+- `POST /title-card` — body `{"text": "...", "width": 1080, "height": 1920}` — returns just the title card as a PNG, for videos edited by hand (Filmora/CapCut): drop it as the first ~1-1.5s clip before the footage.
 
 ## Environment variables
 

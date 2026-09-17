@@ -8,17 +8,31 @@ import requests
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
 app = FastAPI(title="video-trim-api")
 
 API_KEY = os.environ.get("API_KEY", "")
 
+# Title card ("hook" cover frame burned into the first ~1.4s of a clip) --
+# brand colors from the Atendo design system (Navy + Teal). Font path points
+# at fonts-dejavu-core, installed in the Dockerfile; override locally via
+# env var when testing off a machine without that package installed.
+TITLE_CARD_BG = (15, 23, 42)      # Navy #0F172A
+TITLE_CARD_ACCENT = (20, 184, 166)  # Teal #14B8A6
+TITLE_CARD_TEXT = (255, 255, 255)
+TITLE_CARD_FONT_PATH = os.environ.get(
+    "TITLE_CARD_FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+)
+
 
 class TrimRequest(BaseModel):
     video_url: str
     start: float  # seconds
     end: float  # seconds
+    title_text: str | None = None  # optional hook/title card burned into the first title_seconds
+    title_seconds: float = 1.4
 
 
 class ExtractAudioRequest(BaseModel):
@@ -44,10 +58,18 @@ class Caption(BaseModel):
     text: str
 
 
+class TitleCardRequest(BaseModel):
+    text: str
+    width: int = 1080
+    height: int = 1920
+
+
 class ComposeRequest(BaseModel):
     background_video_url: str
     audio_url: str
     captions: list[Caption] = []
+    title_text: str | None = None  # optional hook/title card burned into the first title_seconds
+    title_seconds: float = 1.4
 
 
 def check_api_key(x_api_key: str | None):
@@ -78,7 +100,11 @@ def trim(req: TrimRequest, x_api_key: str | None = Header(default=None)):
 
     try:
         _download(req.video_url, input_path)
-        _run_ffmpeg_trim(input_path, output_path, req.start, duration)
+        title_card_path = None
+        if req.title_text:
+            title_card_path = os.path.join(tmp_dir, "card.png")
+            _render_title_card(req.title_text, 1080, 1920, title_card_path)
+        _run_ffmpeg_trim(input_path, output_path, req.start, duration, title_card_path, req.title_seconds)
         return FileResponse(output_path, media_type="video/mp4", filename="clip.mp4")
     finally:
         # FileResponse streams the file before this process exits normally,
@@ -249,6 +275,20 @@ def _run_ffprobe(input_path: str) -> dict:
     }
 
 
+@app.post("/title-card")
+def title_card(req: TitleCardRequest, x_api_key: str | None = Header(default=None)):
+    # Standalone title card as a plain PNG -- for videos edited by hand
+    # (Filmora/CapCut), not just the automated /trim and /compose pipelines.
+    # Drop this as the first ~1-1.5s clip before the talking-head footage.
+    check_api_key(x_api_key)
+
+    job_id = uuid.uuid4().hex
+    tmp_dir = tempfile.mkdtemp(prefix=f"card-{job_id}-")
+    out_path = os.path.join(tmp_dir, "card.png")
+    _render_title_card(req.text, req.width, req.height, out_path)
+    return FileResponse(out_path, media_type="image/png", filename="title-card.png")
+
+
 @app.post("/compose")
 def compose(req: ComposeRequest, x_api_key: str | None = Header(default=None)):
     check_api_key(x_api_key)
@@ -264,7 +304,15 @@ def compose(req: ComposeRequest, x_api_key: str | None = Header(default=None)):
     _download(req.audio_url, audio_path)
     audio_duration = _get_duration(audio_path)
     _write_srt(req.captions, srt_path)
-    _run_ffmpeg_compose(bg_path, audio_path, srt_path, audio_duration, output_path)
+
+    title_card_path = None
+    if req.title_text:
+        title_card_path = os.path.join(tmp_dir, "card.png")
+        _render_title_card(req.title_text, 1080, 1920, title_card_path)
+
+    _run_ffmpeg_compose(
+        bg_path, audio_path, srt_path, audio_duration, output_path, title_card_path, req.title_seconds
+    )
     return FileResponse(output_path, media_type="video/mp4", filename="composed.mp4")
 
 
@@ -292,7 +340,15 @@ def _write_srt(captions: list[Caption], path: str):
             f.write(f"{c.text}\n\n")
 
 
-def _run_ffmpeg_compose(bg_path: str, audio_path: str, srt_path: str, duration: float, output_path: str):
+def _run_ffmpeg_compose(
+    bg_path: str,
+    audio_path: str,
+    srt_path: str,
+    duration: float,
+    output_path: str,
+    title_card_path: str | None = None,
+    title_seconds: float = 1.4,
+):
     # Loop the background to cover the full audio length, crop/scale to 1080x1920
     # (covers both landscape and already-vertical source loops), burn in captions
     # from the srt, and replace the background's own audio with the TTS track.
@@ -301,17 +357,43 @@ def _run_ffmpeg_compose(bg_path: str, audio_path: str, srt_path: str, duration: 
         "FontSize=64,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
         "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=250"
     )
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", bg_path,
-        "-i", audio_path,
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,subtitles={srt_escaped}:force_style='{subtitle_style}'",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-t", str(duration),
-        output_path,
-    ]
+    base_vf = (
+        f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+        f"subtitles={srt_escaped}:force_style='{subtitle_style}'"
+    )
+    if title_card_path:
+        # Third input (the pre-rendered title card PNG) is overlaid on top of the
+        # composed frame only for the first title_seconds -- same single ffmpeg
+        # pass, no extra encode, so it doesn't add runtime on Render's free tier.
+        filter_complex = (
+            f"[0:v]{base_vf}[base];"
+            f"[2:v]format=rgba[card];"
+            f"[base][card]overlay=0:0:enable='lt(t,{title_seconds})'[v]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", bg_path,
+            "-i", audio_path,
+            "-loop", "1", "-i", title_card_path,
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-t", str(duration),
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", bg_path,
+            "-i", audio_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", base_vf,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-t", str(duration),
+            output_path,
+        ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
     except subprocess.TimeoutExpired:
@@ -351,7 +433,14 @@ def _download(url: str, dest_path: str):
         raise HTTPException(status_code=400, detail=f"could not download video_url: {e}")
 
 
-def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: float):
+def _run_ffmpeg_trim(
+    input_path: str,
+    output_path: str,
+    start: float,
+    duration: float,
+    title_card_path: str | None = None,
+    title_seconds: float = 1.4,
+):
     # Re-encode (not stream copy) so the cut lands exactly on start/duration
     # regardless of keyframe placement in the source file. Crop to 9:16 at the
     # source resolution FIRST, then scale to 1080x1920 — scaling first (as the
@@ -359,19 +448,100 @@ def _run_ffmpeg_trim(input_path: str, output_path: str, start: float, duration: 
     # frame (e.g. 1920x1080 -> 3413x1920) before cropping, which timed out on
     # Render's free-tier CPU.
     crop = "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'"
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-i", input_path,
-        "-t", str(duration),
-        "-vf", f"{crop},scale=1080:1920",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ]
+    if title_card_path:
+        # Second input (the pre-rendered title card PNG) is overlaid on top of
+        # the cropped/scaled clip only for the first title_seconds -- same
+        # single ffmpeg pass, no extra encode/runtime.
+        filter_complex = (
+            f"[0:v]{crop},scale=1080:1920[base];"
+            f"[1:v]format=rgba[card];"
+            f"[base][card]overlay=0:0:enable='lt(t,{title_seconds})'[v]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", input_path,
+            "-loop", "1", "-i", title_card_path,
+            "-t", str(duration),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", input_path,
+            "-t", str(duration),
+            "-vf", f"{crop},scale=1080:1920",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out after 280s")
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
+
+
+def _wrap_text(draw: "ImageDraw.ImageDraw", text: str, font: "ImageFont.FreeTypeFont", max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        if draw.textlength(trial, font=font) <= max_width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _render_title_card(text: str, width: int, height: int, out_path: str):
+    # Full-frame cover card burned into the first ~1.4s of a video so viewers
+    # know what it's about before the talking head or footage starts -- the
+    # "graphic hook" every video in the Content System was missing. On-brand
+    # Navy/Teal (Atendo design system), auto-wrapped and auto-shrunk to fit.
+    img = Image.new("RGB", (width, height), TITLE_CARD_BG)
+    draw = ImageDraw.Draw(img)
+
+    max_text_width = int(width * 0.82)
+    max_text_height = int(height * 0.42)
+    font_size = 96
+    lines: list[str] = [text]
+    font = ImageFont.truetype(TITLE_CARD_FONT_PATH, font_size)
+    while font_size > 36:
+        font = ImageFont.truetype(TITLE_CARD_FONT_PATH, font_size)
+        lines = _wrap_text(draw, text, font, max_text_width)
+        line_height = font.getbbox("Ag")[3] + 18
+        block_height = line_height * len(lines)
+        widest = max((draw.textlength(line, font=font) for line in lines), default=0)
+        if block_height <= max_text_height and widest <= max_text_width:
+            break
+        font_size -= 4
+
+    line_height = font.getbbox("Ag")[3] + 18
+    block_height = line_height * len(lines)
+
+    # Teal accent bar centered above the text block, brand kicker style.
+    bar_w, bar_h = 96, 8
+    bar_x = (width - bar_w) // 2
+    bar_y = height // 2 - block_height // 2 - 50
+    draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=TITLE_CARD_ACCENT)
+
+    y = height // 2 - block_height // 2
+    for line in lines:
+        line_w = draw.textlength(line, font=font)
+        x = (width - line_w) // 2
+        draw.text((x, y), line, font=font, fill=TITLE_CARD_TEXT)
+        y += line_height
+
+    img.save(out_path)
